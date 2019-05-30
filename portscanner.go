@@ -6,7 +6,6 @@ import "net"
 import "time"
 import "encoding/binary"
 import "strconv"
-import "sync"
 import "bytes"
 import "math/rand"
 
@@ -48,6 +47,16 @@ func (hdr TCPHeader) ToBytesAndCsum(src net.IP, dst net.IP) []byte {
     binary.LittleEndian.PutUint16(buf[16:], csum) // don't know why
 
     return buf
+}
+
+func BytesToTCPHeader(b []byte) TCPHeader {
+    var header TCPHeader
+    r := bytes.NewReader(b)
+    err := binary.Read(r, binary.BigEndian, &header)
+    if err != nil {
+        panic(err.Error())
+    }
+    return header
 }
 
 func IPToLong(ip string) uint32 {
@@ -131,35 +140,12 @@ func doPingProbe(addr string) {
     }
 }
 
-func sendSyn(addr string, port uint16, wg *sync.WaitGroup) {
-    defer wg.Done()
+func sendSyn(addr string, port uint16) {
     srcport := uint16(rand.Intn(16383) + 49152)
     conn, err := net.Dial("ip4:tcp", addr)
     if err != nil {
         panic(err.Error())
     }
-    /* buf := make([]byte, 20, 20)
-    buf[1] = byte(srcport & 0x00ff)
-    buf[0] = byte(srcport >> 8)
-    buf[3] = byte(port & 0x00ff)
-    buf[2] = byte(port >> 8)
-
-    buf[4] = 200
-    buf[5] = 100
-    buf[6] = 200
-
-    headsize := byte(5)
-    buf[12] = headsize << 4
-    buf[13] = 2
-
-    buf[14] = 200 // window
-    buf[15] = 0
-
-    pseudobuf := make([]byte, 32, 32)
-
-    csum := checksum(pseudobuf, 32)
-    buf[16] = byte(csum & 0x00ff)
-    buf[17] = byte(csum >> 8) */
 
     hdr := TCPHeader {
         SrcPort: srcport,
@@ -181,14 +167,54 @@ func sendSyn(addr string, port uint16, wg *sync.WaitGroup) {
     }
 }
 
-func doSynScan(addr string, port string) {
-    var wg sync.WaitGroup
-    val, err := strconv.Atoi(port)
+func IsInMap(m map[uint16]string, val string) bool {
+    for _, v := range m {
+        if v == val {
+            return true
+        }
+    }
+    return false
+}
+
+func listenICMP(addr string, c chan uint16) {
+    all, err := net.ResolveIPAddr("ip4", "0.0.0.0")
     if err != nil {
         panic(err.Error())
     }
-    wg.Add(1)
-    go sendSyn(addr, uint16(val), &wg)
+
+    listen, err := net.ListenIP("ip4:icmp", all)
+    if err != nil {
+        panic(err.Error())
+    }
+
+    buf := make([]byte, 200, 200)
+    for true {
+        _, src, err := listen.ReadFromIP(buf)
+        if err != nil {
+            panic(err.Error())
+        }
+        if src.String() == addr && buf[0] == 3 && buf[1] == 3 { // destination unreachable / port unreachable
+            tcphdr := BytesToTCPHeader(buf[28:])
+            c <- tcphdr.DstPort
+        }
+    }
+}
+
+func doSynScan(addr string, ports []string) map[uint16]string {
+    states := make(map[uint16]string)
+    for _, port := range ports {
+        val, err := strconv.Atoi(port)
+        if err != nil {
+            panic(err.Error())
+        }
+        states[uint16(val)] = "unknown"
+        go sendSyn(addr, uint16(val))
+    }
+
+    c := make(chan uint16, 100)
+
+    go listenICMP(addr, c)
+
     all, err := net.ResolveIPAddr("ip4", "0.0.0.0")
     if err != nil {
         panic(err.Error())
@@ -198,21 +224,49 @@ func doSynScan(addr string, port string) {
         panic(err.Error())
     }
     buf := make([]byte, 100, 100)
-    for true {
+
+    start_time := time.Now()
+    for IsInMap(states, "unknown") && time.Now().Sub(start_time) < 1e9 {
         _, src, err := listen.ReadFromIP(buf)
         if err != nil {
             panic(err.Error())
         }
-        if src.String() == addr {
-            if buf[13] == 0x12 {
-                fmt.Println("SYN/ACK")
+        hdr := BytesToTCPHeader(buf)
+        if src.String() == addr && states[hdr.SrcPort] == "unknown" {
+            if hdr.Flags & 0x12 == 0x12 { // ack / syn
+                states[hdr.SrcPort] = "open"
+            } else if hdr.Flags & 0x4 == 0x4 { // rst
+                states[hdr.SrcPort] = "closed"
             }
         }
+        select {
+        case p := <-c:
+            states[p] = "closed"
+        default:
+        }
     }
-    wg.Wait()
+
+    for len(c) > 0 {
+        states[<-c] = "closed"
+    }
+    for k, v := range states {
+        if v == "unknown" {
+            states[k] = "filtered"
+        }
+    }
+
+    return states
 }
 
 func main() {
+    if len(os.Args) < 3 {
+        fmt.Printf("Usage: %s <ip> <ports...>", os.Args[0])
+        return
+    }
     rand.Seed(int64(time.Now().Nanosecond()))
-    doSynScan(os.Args[1], os.Args[2])
+    states := doSynScan(os.Args[1], os.Args[2:])
+
+    for k, v := range states {
+        fmt.Printf(" %5d - %s\n", k, v)
+    }
 }
